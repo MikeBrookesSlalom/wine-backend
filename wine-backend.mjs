@@ -45,14 +45,27 @@ async function runActor(input) {
   return res.json();
 }
 
+// Map any Trolley store name to a short key. Returns the name for all tracked supermarkets.
+const STORE_MAP = [
+  ["tesco", "Tesco"],
+  ["sainsbury", "Sainsbury's"],
+  ["asda", "ASDA"],
+  ["waitrose", "Waitrose"],
+  ["ocado", "M&S"],        // M&S groceries sell via Ocado
+  ["marks", "M&S"],
+  ["m&s", "M&S"],
+  ["morrison", "Morrisons"],
+  ["aldi", "Aldi"],
+  ["lidl", "Lidl"],
+  ["co-op", "Co-op"],
+  ["coop", "Co-op"],
+  ["iceland", "Iceland"],
+  ["amazon", "Amazon"],
+];
 function normaliseRetailer(name) {
   const n = String(name || "").toLowerCase();
-  if (n.includes("tesco")) return "Tesco";
-  if (n.includes("sainsbury")) return "Sainsbury's";
-  if (n.includes("asda")) return "ASDA";
-  if (n.includes("waitrose")) return "Waitrose";
-  if (n.includes("m&s") || n.includes("marks") || n.includes("ocado")) return "M&S";
-  return null; // ignore Morrisons/Aldi/etc — not tracked in the app
+  for (const [needle, label] of STORE_MAP) { if (n.includes(needle)) return label; }
+  return null;
 }
 
 const VARIANT_WORDS = ["the pale","the beach","rock angel","magnum","limited edition","gift","jeroboam","personalised","case of"];
@@ -126,9 +139,112 @@ async function fetchPricesForIds(idList) {
   return byId;
 }
 
+/* ---------- Majestic Wine (direct, not on Trolley) ---------- */
+const BROWSER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-GB,en;q=0.9",
+};
+
+// pull every JSON-LD block from a page and return parsed objects
+function extractJsonLd(html) {
+  const blocks = [];
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    try { blocks.push(JSON.parse(m[1].trim())); } catch (_) {}
+  }
+  return blocks;
+}
+
+// find a Product price inside parsed JSON-LD (schema.org)
+function priceFromJsonLd(blocks) {
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const n of node) { const r = walk(n); if (r) return r; } return null; }
+    const type = node["@type"];
+    const isProduct = type === "Product" || (Array.isArray(type) && type.includes("Product"));
+    if (isProduct && node.offers) {
+      const offers = Array.isArray(node.offers) ? node.offers : [node.offers];
+      for (const o of offers) {
+        const p = o.price ?? o.lowPrice ?? (o.priceSpecification && o.priceSpecification.price);
+        if (p != null) {
+          const num = parseFloat(String(p).replace(/[^\d.]/g, ""));
+          if (!isNaN(num) && num > 0) return { price: num, name: node.name || null };
+        }
+      }
+    }
+    for (const k of Object.keys(node)) { const r = walk(node[k]); if (r) return r; }
+    return null;
+  };
+  return walk(blocks);
+}
+
+async function scrapeMajestic(wineName, wantDebug = false) {
+  const debug = { steps: [] };
+  try {
+    const searchUrl = `https://www.majestic.co.uk/search?q=${encodeURIComponent(wineName)}`;
+    const sRes = await fetch(searchUrl, { headers: BROWSER_HEADERS, redirect: "follow" });
+    debug.searchUrl = searchUrl;
+    debug.searchStatus = sRes.status;
+    if (!sRes.ok) {
+      debug.steps.push(`search HTTP ${sRes.status}`);
+      return { price: null, debug };
+    }
+    const sHtml = await sRes.text();
+    debug.searchHtmlLength = sHtml.length;
+
+    // find the first product link (Majestic product URLs contain /wines/ or /product or an id)
+    const linkMatch =
+      sHtml.match(/href=["'](https?:\/\/www\.majestic\.co\.uk)?(\/[^"']*?(?:wines?|product)[^"']*?-\d{3,}[^"']*?)["']/i) ||
+      sHtml.match(/href=["'](https?:\/\/www\.majestic\.co\.uk)?(\/[^"']*?\/\d{4,}[^"']*?)["']/i);
+    if (!linkMatch) {
+      debug.steps.push("no product link found in search HTML");
+      if (wantDebug) debug.searchSnippet = sHtml.slice(0, 1500);
+      return { price: null, debug };
+    }
+    const productUrl = (linkMatch[1] || "https://www.majestic.co.uk") + linkMatch[2];
+    debug.productUrl = productUrl;
+
+    const pRes = await fetch(productUrl, { headers: BROWSER_HEADERS, redirect: "follow" });
+    debug.productStatus = pRes.status;
+    if (!pRes.ok) { debug.steps.push(`product HTTP ${pRes.status}`); return { price: null, debug }; }
+    const pHtml = await pRes.text();
+
+    const jsonLd = extractJsonLd(pHtml);
+    debug.jsonLdBlocks = jsonLd.length;
+    const found = priceFromJsonLd(jsonLd);
+    if (found) {
+      debug.steps.push("price from JSON-LD");
+      return { price: found.price, matchedName: found.name, url: productUrl, debug };
+    }
+
+    // fallback: look for a price in the raw HTML meta or price tags
+    const metaPrice = pHtml.match(/itemprop=["']price["'][^>]*content=["']([\d.]+)["']/i) ||
+                      pHtml.match(/"price"\s*:\s*"?([\d.]+)"?/i);
+    if (metaPrice) {
+      debug.steps.push("price from meta/regex");
+      return { price: parseFloat(metaPrice[1]), url: productUrl, debug };
+    }
+
+    debug.steps.push("product page had no parseable price");
+    if (wantDebug) debug.productSnippet = pHtml.slice(0, 1500);
+    return { price: null, debug };
+  } catch (e) {
+    debug.error = e.message;
+    return { price: null, debug };
+  }
+}
+
 /* ---------- routes ---------- */
 app.get("/health", (req, res) =>
   res.json({ status: "ok", uptime: process.uptime(), tokenSet: !!APIFY_TOKEN }));
+
+app.get("/majestic-test", async (req, res) => {
+  const wine = req.query.wine || "Whispering Angel";
+  const out = await scrapeMajestic(String(wine), req.query.debug === "1");
+  res.json({ wine, ...out });
+});
 
 app.get("/test", async (req, res) => {
   try {
@@ -206,7 +322,13 @@ app.post("/prices", async (req, res) => {
       for (const n of needPrice) {
         const data = priceMap[n.productId] || null;
         results[n.name] = data;
-        cache[n.key] = { ...cache[n.key], data, priceAt: new Date().toISOString() };
+        // only cache real results; empty/blank stays uncached so it retries next check
+        if (data && Object.keys(data).length > 0) {
+          cache[n.key] = { ...cache[n.key], data, priceAt: new Date().toISOString() };
+        } else if (cache[n.key]) {
+          delete cache[n.key].data;
+          delete cache[n.key].priceAt;
+        }
       }
     }
 
