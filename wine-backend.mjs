@@ -57,6 +57,7 @@ function normaliseRetailer(name) {
 
 const VARIANT_WORDS = ["the pale","the beach","rock angel","magnum","limited edition","gift","jeroboam","personalised","case of"];
 const SMALL_FORMATS = ["37.5cl","18.7cl","187ml","25cl","20cl","half"];
+const LARGE_FORMATS = ["150cl","100cl","1.5l","1.5 l","3l","3 l","magnum","jeroboam","double magnum"];
 
 /* choose the product record that best matches the wine name, preferring 75cl */
 function pickBest(items, wineName) {
@@ -70,6 +71,7 @@ function pickBest(items, wineName) {
     let score = 100;
     if (size.includes("75cl") || size.includes("750ml") || name.includes("75cl")) score += 30;
     for (const sf of SMALL_FORMATS) { if ((size.includes(sf) || name.includes(sf)) && !wineName.toLowerCase().includes(sf)) score -= 70; }
+    for (const lf of LARGE_FORMATS) { if ((size.includes(lf) || name.includes(lf)) && !wineName.toLowerCase().includes(lf)) score -= 70; }
     for (const vw of VARIANT_WORDS) { if (name.includes(vw) && !wineName.toLowerCase().includes(vw)) score -= 45; }
     if (score > bestScore) { bestScore = score; best = it; }
   }
@@ -125,10 +127,19 @@ app.get("/health", (req, res) =>
 app.get("/test", async (req, res) => {
   try {
     const wine = req.query.wine || "Whispering Angel";
-    const resolved = await resolveProductId(String(wine));
-    if (!resolved) return res.json({ wine, matched: null, prices: {} });
-    const priceMap = await fetchPricesForIds([resolved.productId]);
-    res.json({ wine, matched: resolved.matchedName, productId: resolved.productId, prices: priceMap[resolved.productId] || {} });
+    const wantDebug = req.query.debug === "1";
+
+    const items = await runActor({ mode: "search", searchQuery: String(wine), sortOrder: "relevance", maxItems: 12 });
+    const best = pickBest(items, String(wine));
+
+    if (wantDebug) {
+      const candidates = items.map((it) => ({ productId: it.productId, name: it.name, size: it.size, price: it.price }));
+      return res.json({ wine, matched: best?.name || null, productId: best?.productId || null, candidates });
+    }
+
+    if (!best) return res.json({ wine, matched: null, prices: {} });
+    const priceMap = await fetchPricesForIds([best.productId]);
+    res.json({ wine, matched: best.name, productId: best.productId, prices: priceMap[best.productId] || {} });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
