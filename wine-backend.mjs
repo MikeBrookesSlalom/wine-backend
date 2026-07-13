@@ -5,7 +5,7 @@ import * as fs from "fs";
 const app = express();
 const PORT = process.env.PORT || 3000;
 const CACHE_FILE = "/tmp/price-cache.json";
-const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days (weekly refresh use case)
+const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -16,41 +16,26 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ============ Cache ============ */
 function loadCache() {
-  try {
-    if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
-  } catch (e) { console.warn("cache load:", e.message); }
+  try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); }
+  catch (e) { console.warn("cache load:", e.message); }
   return {};
 }
 function saveCache(c) {
-  try { fs.writeFileSync(CACHE_FILE, JSON.stringify(c)); }
-  catch (e) { console.warn("cache save:", e.message); }
+  try { fs.writeFileSync(CACHE_FILE, JSON.stringify(c)); } catch (e) { console.warn("cache save:", e.message); }
 }
-function fresh(entry) {
-  return entry && entry.at && Date.now() - new Date(entry.at).getTime() < CACHE_TTL;
-}
+function fresh(entry) { return entry && entry.at && Date.now() - new Date(entry.at).getTime() < CACHE_TTL; }
 
-/* ============ Browser (single shared instance) ============ */
 let browserPromise = null;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = puppeteer.launch({
       headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-        "--no-zygote",
-      ],
+      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"],
     });
   }
   return browserPromise;
 }
-
-const RETAILER_KEYS = ["Tesco", "Sainsbury's", "Sainsburys", "ASDA", "Asda", "Waitrose", "M&S", "Marks", "Ocado", "Morrisons"];
 
 function normaliseRetailer(name) {
   const n = name.toLowerCase();
@@ -62,98 +47,130 @@ function normaliseRetailer(name) {
   return null;
 }
 
-/* ============ Scrape one wine ============ */
+// Words that mark a NON-standard variant we should avoid unless explicitly searched
+const VARIANT_WORDS = ["limited edition","magnum","the beach","gift","half bottle","187ml","half","1.5l","3l","jeroboam","personalised","case of","x6","x 6","6 x","12 x"];
+
+/* Score how well a product title matches the query.
+   Higher = better. Returns -1 if it should be rejected. */
+function matchScore(title, queryTerms, query) {
+  const t = title.toLowerCase();
+  // every query word must be present
+  for (const w of queryTerms) { if (!t.includes(w)) return -1; }
+  let score = 100;
+  // penalise variant products unless the query asked for that word
+  for (const vw of VARIANT_WORDS) {
+    if (t.includes(vw) && !query.toLowerCase().includes(vw)) score -= 40;
+  }
+  // prefer shorter titles (closer to the plain product)
+  score -= Math.min(30, Math.floor(t.length / 6));
+  return score;
+}
+
+/* Pull retailer+price pairs from a product-page JSON payload.
+   Only accepts a "current price" number; ignores per-litre & was-prices by key name. */
+function harvestPrices(node, out, depth = 0) {
+  if (depth > 9 || node == null) return;
+  if (Array.isArray(node)) { for (const it of node) harvestPrices(it, out, depth + 1); return; }
+  if (typeof node !== "object") return;
+
+  const keys = Object.keys(node);
+  let retailerName = null;
+  let price = null;
+
+  for (const k of keys) {
+    const v = node[k];
+    const kl = k.toLowerCase();
+    if (typeof v === "string" && (kl.includes("retailer") || kl.includes("merchant") || kl.includes("store") || kl.includes("shop") || kl.includes("seller") || kl.includes("supermarket"))) {
+      retailerName = v;
+    }
+    // accept only a clean current-price key; skip anything per-unit / was / rrp / historic
+    const isPriceKey = (kl === "price" || kl === "currentprice" || kl === "current_price" || kl === "priceinpence" || kl === "amount");
+    const isBadPriceKey = kl.includes("unit") || kl.includes("was") || kl.includes("rrp") || kl.includes("litre") || kl.includes("perl") || kl.includes("history") || kl.includes("low") || kl.includes("high") || kl.includes("avg");
+    if (isPriceKey && !isBadPriceKey && (typeof v === "number" || (typeof v === "string" && /^\s*£?\s*\d+(\.\d{1,2})?\s*$/.test(v)))) {
+      let p = typeof v === "number" ? v : parseFloat(String(v).replace(/[^\d.]/g, ""));
+      if (kl.includes("pence") && p > 100) p = p / 100; // pence -> pounds
+      if (!isNaN(p) && p >= 2 && p < 500) price = p;
+    }
+  }
+
+  if (retailerName && price != null) {
+    const r = normaliseRetailer(retailerName);
+    if (r && !out[r]) out[r] = { stocked: true, price, source: "trolley.co.uk" };
+  }
+  for (const k of keys) harvestPrices(node[k], out, depth + 1);
+}
+
 async function scrapeWine(wineName) {
   const browser = await getBrowser();
   const page = await browser.newPage();
-  const captured = []; // JSON blobs intercepted from network
+  let captured = [];
 
   try {
-    await page.setUserAgent(
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
-    );
+    await page.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36");
     await page.setViewport({ width: 1200, height: 900 });
 
-    // Intercept JSON responses — this is where the real price data lives
     page.on("response", async (res) => {
       try {
         const ct = res.headers()["content-type"] || "";
         if (!ct.includes("application/json")) return;
-        const url = res.url();
-        // Only bother with same-site API-ish calls
-        if (!/trolley\.co\.uk/i.test(url)) return;
+        if (!/trolley\.co\.uk/i.test(res.url())) return;
         const text = await res.text();
-        if (text && (text.includes("price") || text.includes("Price") || text.includes("£"))) {
-          captured.push({ url, text });
-        }
+        if (text && /price/i.test(text)) captured.push(text);
       } catch (_) {}
     });
 
+    // 1) search
     const searchUrl = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(wineName)}`;
-    console.log(`[scrape] ${wineName} -> ${searchUrl}`);
+    console.log(`[scrape] ${wineName}`);
     await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 25000 });
 
-    // Try to land on the first product to get its full retailer comparison
-    let productHref = null;
-    try {
-      productHref = await page.evaluate(() => {
-        const a = document.querySelector('a[href*="/product/"]');
-        return a ? a.href : null;
-      });
-    } catch (_) {}
-
-    if (productHref) {
-      console.log(`[scrape] product: ${productHref}`);
-      await page.goto(productHref, { waitUntil: "networkidle2", timeout: 25000 });
-      await new Promise((r) => setTimeout(r, 1500)); // let price widgets settle
-    }
-
-    // Strategy 1: parse intercepted JSON for retailer/price pairs
-    const results = {};
-    for (const blob of captured) {
-      try {
-        const data = JSON.parse(blob.text);
-        harvestPrices(data, results);
-      } catch (_) {}
-    }
-
-    // Strategy 2: DOM extraction fallback
-    if (Object.keys(results).length === 0) {
-      const domRows = await page.evaluate(() => {
-        const out = [];
-        // grab any element whose text contains £ and sits near a retailer name
-        const all = Array.from(document.querySelectorAll("*"));
-        for (const el of all) {
-          const t = (el.textContent || "").trim();
-          if (t.length > 0 && t.length < 60 && /£\s?\d+\.\d{2}/.test(t)) {
-            out.push(t);
-          }
-        }
-        return out.slice(0, 200);
-      });
-      // Try to associate retailer names with prices from surrounding text
-      const pageText = await page.evaluate(() => document.body.innerText || "");
-      for (const key of ["Tesco", "Sainsbury", "Asda", "ASDA", "Waitrose", "Ocado", "M&S"]) {
-        const re = new RegExp(`${key}[^£]{0,40}£\\s?(\\d+\\.\\d{2})`, "i");
-        const m = pageText.match(re);
-        if (m) {
-          const r = normaliseRetailer(key);
-          const price = parseFloat(m[1]);
-          if (r && !results[r] && price > 0 && price < 200) {
-            results[r] = { stocked: true, price, source: "trolley.co.uk" };
-          }
-        }
+    // 2) pick the best-matching product link
+    const queryTerms = wineName.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+    const candidates = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href*="/product/"]'));
+      const seen = {};
+      const out = [];
+      for (const a of links) {
+        const href = a.href;
+        if (seen[href]) continue;
+        seen[href] = true;
+        const title = (a.textContent || "").trim().replace(/\s+/g, " ");
+        if (title) out.push({ href, title });
       }
+      return out.slice(0, 15);
+    });
+
+    let best = null, bestScore = -1;
+    for (const c of candidates) {
+      const s = matchScore(c.title, queryTerms, wineName);
+      if (s > bestScore) { bestScore = s; best = c; }
+    }
+
+    if (!best || bestScore < 0) {
+      console.log(`[scrape] ${wineName}: no matching product`);
+      await page.close();
+      return null;
+    }
+
+    // 3) load that product page, capturing ONLY its price JSON
+    captured = [];
+    console.log(`[scrape] matched: ${best.title}`);
+    await page.goto(best.href, { waitUntil: "networkidle2", timeout: 25000 });
+    await new Promise((r) => setTimeout(r, 1800));
+
+    const results = {};
+    for (const text of captured) {
+      try { harvestPrices(JSON.parse(text), results); } catch (_) {}
     }
 
     await page.close();
 
     if (Object.keys(results).length > 0) {
-      console.log(`[scrape] ${wineName}: found ${Object.keys(results).length} retailers`);
-      return results;
+      console.log(`[scrape] ${wineName}: ${Object.keys(results).length} retailers`);
+      return { matchedProduct: best.title, prices: results };
     }
-    console.log(`[scrape] ${wineName}: no prices`);
-    return null;
+    console.log(`[scrape] ${wineName}: matched product but no clean prices`);
+    return { matchedProduct: best.title, prices: {} };
   } catch (e) {
     console.error(`[scrape] ${wineName} error:`, e.message);
     try { await page.close(); } catch (_) {}
@@ -161,46 +178,12 @@ async function scrapeWine(wineName) {
   }
 }
 
-/* Recursively walk a JSON object looking for retailer + price shapes */
-function harvestPrices(node, out, depth = 0) {
-  if (depth > 8 || node == null) return;
-  if (Array.isArray(node)) {
-    for (const item of node) harvestPrices(item, out, depth + 1);
-    return;
-  }
-  if (typeof node === "object") {
-    // Look for a retailer name + a price on the same object
-    const keys = Object.keys(node);
-    let retailerName = null;
-    let price = null;
-    for (const k of keys) {
-      const v = node[k];
-      const kl = k.toLowerCase();
-      if (typeof v === "string" && (kl.includes("retailer") || kl.includes("merchant") || kl.includes("store") || kl.includes("shop") || kl.includes("seller"))) {
-        retailerName = v;
-      }
-      if ((kl === "price" || kl.includes("price")) && (typeof v === "number" || (typeof v === "string" && /\d/.test(v)))) {
-        const p = typeof v === "number" ? v : parseFloat(String(v).replace(/[^\d.]/g, ""));
-        if (!isNaN(p) && p > 0 && p < 500) price = p;
-      }
-    }
-    if (retailerName && price != null) {
-      const r = normaliseRetailer(retailerName);
-      if (r && !out[r]) out[r] = { stocked: true, price, source: "trolley.co.uk" };
-    }
-    for (const k of keys) harvestPrices(node[k], out, depth + 1);
-  }
-}
-
-/* ============ API ============ */
-app.get("/health", async (req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
-});
+app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
 
 app.get("/test", async (req, res) => {
   const wine = req.query.wine || "Whispering Angel";
-  const prices = await scrapeWine(String(wine));
-  res.json({ wine, prices });
+  const out = await scrapeWine(String(wine));
+  res.json({ wine, result: out });
 });
 
 app.post("/prices", async (req, res) => {
@@ -223,22 +206,16 @@ app.post("/prices", async (req, res) => {
       continue;
     }
 
-    const prices = await scrapeWine(name);
-    cache[key] = { data: prices, at: new Date().toISOString() };
+    const out = await scrapeWine(name);
+    const prices = out && out.prices && Object.keys(out.prices).length ? out.prices : null;
+    cache[key] = { data: prices, at: new Date().toISOString(), matched: out?.matchedProduct || null };
     results[name] = prices;
     if (prices) fetched++;
     saveCache(cache);
-    await new Promise((r) => setTimeout(r, 800)); // polite pause
+    await new Promise((r) => setTimeout(r, 800));
   }
 
-  res.json({
-    results,
-    fetched,
-    cached,
-    note: `Fetched ${fetched}, ${cached} from cache (7-day). Live from Trolley.co.uk.`,
-  });
+  res.json({ results, fetched, cached, note: `Fetched ${fetched}, ${cached} cached (7-day). Live from Trolley.co.uk.` });
 });
 
-app.listen(PORT, () => {
-  console.log(`Wine backend (Puppeteer) on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Wine backend (Puppeteer, strict) on :${PORT}`));
