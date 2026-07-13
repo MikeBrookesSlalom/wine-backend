@@ -1,11 +1,13 @@
 import express from "express";
-import puppeteer from "puppeteer";
 import * as fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const APIFY_TOKEN = process.env.APIFY_TOKEN || "";
+const ACTOR = "crawlerbros~trolley-grocery-price-scraper";
 const CACHE_FILE = "/tmp/price-cache.json";
-const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+const PRICE_TTL = 7 * 24 * 60 * 60 * 1000;   // prices: 7 days
+const ID_TTL = 90 * 24 * 60 * 60 * 1000;      // productId mapping: 90 days
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -16,6 +18,7 @@ app.use((req, res, next) => {
   next();
 });
 
+/* ---------- cache ---------- */
 function loadCache() {
   try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); }
   catch (e) { console.warn("cache load:", e.message); }
@@ -24,246 +27,175 @@ function loadCache() {
 function saveCache(c) {
   try { fs.writeFileSync(CACHE_FILE, JSON.stringify(c)); } catch (e) { console.warn("cache save:", e.message); }
 }
-function fresh(entry) { return entry && entry.at && Date.now() - new Date(entry.at).getTime() < CACHE_TTL; }
+const ageOk = (ts, ttl) => ts && Date.now() - new Date(ts).getTime() < ttl;
 
-let browserPromise = null;
-function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"],
-    });
+/* ---------- Apify ---------- */
+async function runActor(input) {
+  if (!APIFY_TOKEN) throw new Error("APIFY_TOKEN not set");
+  const url = `https://api.apify.com/v2/acts/${ACTOR}/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Apify ${res.status}: ${t.slice(0, 200)}`);
   }
-  return browserPromise;
+  return res.json();
 }
 
 function normaliseRetailer(name) {
-  const n = name.toLowerCase();
+  const n = String(name || "").toLowerCase();
   if (n.includes("tesco")) return "Tesco";
   if (n.includes("sainsbury")) return "Sainsbury's";
   if (n.includes("asda")) return "ASDA";
   if (n.includes("waitrose")) return "Waitrose";
   if (n.includes("m&s") || n.includes("marks") || n.includes("ocado")) return "M&S";
-  return null;
+  return null; // ignore Morrisons/Aldi/etc — not tracked in the app
 }
 
-// Words that mark a NON-standard variant we should avoid unless explicitly searched
-const VARIANT_WORDS = ["limited edition","magnum","the beach","gift","half bottle","187ml","18.7cl","37.5cl","25cl","20cl","half","1.5l","3l","jeroboam","personalised","case of","x6","x 6","6 x","12 x"];
-const SMALL_FORMATS = ["37.5cl","18.7cl","187ml","25cl","20cl","half bottle"];
+const VARIANT_WORDS = ["the pale","the beach","rock angel","magnum","limited edition","gift","jeroboam","personalised","case of"];
+const SMALL_FORMATS = ["37.5cl","18.7cl","187ml","25cl","20cl","half"];
 
-/* Score how well a product title matches the query.
-   Higher = better. Returns -1 if it should be rejected. */
-function matchScore(title, queryTerms, query) {
-  const t = title.toLowerCase();
-  const ql = query.toLowerCase();
-  // every query word must be present
-  for (const w of queryTerms) { if (!t.includes(w)) return -1; }
-  let score = 100;
-  // strongly prefer the standard 75cl bottle
-  if (t.includes("75cl") || t.includes("750ml")) score += 30;
-  // heavily penalise small formats unless the query asked for one
-  for (const sf of SMALL_FORMATS) { if (t.includes(sf) && !ql.includes(sf)) score -= 70; }
-  // penalise other variant products unless explicitly searched
-  for (const vw of VARIANT_WORDS) { if (t.includes(vw) && !ql.includes(vw)) score -= 40; }
-  return score;
-}
-
-/* Pull retailer+price pairs from a product-page JSON payload.
-   Only accepts a "current price" number; ignores per-litre & was-prices by key name. */
-function harvestPrices(node, out, depth = 0) {
-  if (depth > 9 || node == null) return;
-  if (Array.isArray(node)) { for (const it of node) harvestPrices(it, out, depth + 1); return; }
-  if (typeof node !== "object") return;
-
-  const keys = Object.keys(node);
-  let retailerName = null;
-  let price = null;
-
-  for (const k of keys) {
-    const v = node[k];
-    const kl = k.toLowerCase();
-    if (typeof v === "string" && (kl.includes("retailer") || kl.includes("merchant") || kl.includes("store") || kl.includes("shop") || kl.includes("seller") || kl.includes("supermarket"))) {
-      retailerName = v;
-    }
-    // accept only a clean current-price key; skip anything per-unit / was / rrp / historic
-    const isPriceKey = (kl === "price" || kl === "currentprice" || kl === "current_price" || kl === "priceinpence" || kl === "amount");
-    const isBadPriceKey = kl.includes("unit") || kl.includes("was") || kl.includes("rrp") || kl.includes("litre") || kl.includes("perl") || kl.includes("history") || kl.includes("low") || kl.includes("high") || kl.includes("avg");
-    if (isPriceKey && !isBadPriceKey && (typeof v === "number" || (typeof v === "string" && /^\s*£?\s*\d+(\.\d{1,2})?\s*$/.test(v)))) {
-      let p = typeof v === "number" ? v : parseFloat(String(v).replace(/[^\d.]/g, ""));
-      if (kl.includes("pence") && p > 100) p = p / 100; // pence -> pounds
-      if (!isNaN(p) && p >= 2 && p < 500) price = p;
-    }
+/* choose the product record that best matches the wine name, preferring 75cl */
+function pickBest(items, wineName) {
+  const terms = wineName.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+  let best = null, bestScore = -1;
+  for (const it of items) {
+    const name = String(it.name || "").toLowerCase();
+    const size = String(it.size || "").toLowerCase();
+    if (!name) continue;
+    if (!terms.every((w) => name.includes(w))) continue; // must contain all query words
+    let score = 100;
+    if (size.includes("75cl") || size.includes("750ml") || name.includes("75cl")) score += 30;
+    for (const sf of SMALL_FORMATS) { if ((size.includes(sf) || name.includes(sf)) && !wineName.toLowerCase().includes(sf)) score -= 70; }
+    for (const vw of VARIANT_WORDS) { if (name.includes(vw) && !wineName.toLowerCase().includes(vw)) score -= 45; }
+    if (score > bestScore) { bestScore = score; best = it; }
   }
-
-  if (retailerName && price != null) {
-    const r = normaliseRetailer(retailerName);
-    if (r && !out[r]) out[r] = { stocked: true, price, source: "trolley.co.uk" };
-  }
-  for (const k of keys) harvestPrices(node[k], out, depth + 1);
+  return bestScore >= 0 ? best : null;
 }
 
-async function scrapeWine(wineName, wantDebug = false) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  let captured = [];
-
-  try {
-    await page.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36");
-    await page.setViewport({ width: 1200, height: 900 });
-
-    page.on("response", async (res) => {
-      try {
-        const ct = res.headers()["content-type"] || "";
-        if (!ct.includes("application/json")) return;
-        if (!/trolley\.co\.uk/i.test(res.url())) return;
-        const text = await res.text();
-        if (text && /price/i.test(text)) captured.push(text);
-      } catch (_) {}
-    });
-
-    // 1) search
-    const searchUrl = `https://www.trolley.co.uk/search/?q=${encodeURIComponent(wineName)}`;
-    console.log(`[scrape] ${wineName}`);
-    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 25000 });
-
-    // 2) pick the best-matching product link
-    const queryTerms = wineName.toLowerCase().split(/\s+/).filter(w => w.length > 1);
-    const candidates = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a[href*="/product/"]'));
-      const seen = {};
-      const out = [];
-      for (const a of links) {
-        const href = a.href;
-        if (seen[href]) continue;
-        seen[href] = true;
-        const title = (a.textContent || "").trim().replace(/\s+/g, " ");
-        if (title) out.push({ href, title });
-      }
-      return out.slice(0, 15);
-    });
-
-    let best = null, bestScore = -1;
-    for (const c of candidates) {
-      const s = matchScore(c.title, queryTerms, wineName);
-      if (s > bestScore) { bestScore = s; best = c; }
-    }
-
-    if (!best || bestScore < 0) {
-      console.log(`[scrape] ${wineName}: no matching product`);
-      await page.close();
-      return null;
-    }
-
-    // 3) load that product page, capturing ONLY its price JSON
-    captured = [];
-    console.log(`[scrape] matched: ${best.title}`);
-    await page.goto(best.href, { waitUntil: "networkidle2", timeout: 25000 });
-    await new Promise((r) => setTimeout(r, 1800));
-
-    const results = {};
-
-    // Strategy A: JSON harvest (if Trolley exposes it)
-    for (const text of captured) {
-      try { harvestPrices(JSON.parse(text), results); } catch (_) {}
-    }
-
-    // Strategy B: DOM extraction — find each retailer row and its price via DOM containment
-    const domPrices = await page.evaluate(() => {
-      const RETAILERS = ["Tesco", "Sainsbury", "Asda", "ASDA", "Waitrose", "Ocado", "Morrisons", "Iceland", "Co-op", "Aldi", "Lidl"];
-      const out = [];
-      const priceRe = /£\s?(\d+\.\d{2})/;
-      const all = Array.from(document.querySelectorAll("a, div, li, span, td, tr, article, section"));
-      for (const el of all) {
-        const own = (el.textContent || "").trim();
-        if (own.length > 120) continue;
-        const rName = RETAILERS.find((r) => own.toLowerCase().includes(r.toLowerCase()));
-        if (!rName) continue;
-        let node = el;
-        for (let hop = 0; hop < 4 && node; hop++) {
-          const txt = node.textContent || "";
-          const m = txt.match(priceRe);
-          if (m) {
-            const clean = txt.replace(/\s+/g, " ").trim().slice(0, 100);
-            out.push({ retailer: rName, price: parseFloat(m[1]), context: clean });
-            break;
-          }
-          node = node.parentElement;
-        }
-      }
-      return out;
-    });
-
-    for (const dp of domPrices) {
-      if (/per\s?(100)?\s?ml|per\s?l|\/l|per\s?litre/i.test(dp.context)) continue;
-      const r = normaliseRetailer(dp.retailer);
-      if (r && !results[r] && dp.price >= 2 && dp.price < 500) {
-        results[r] = { stocked: true, price: dp.price, source: "trolley.co.uk" };
-      }
-    }
-
-    let debug = null;
-    if (wantDebug) {
-      const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\n{2,}/g, "\n").slice(0, 2500));
-      debug = {
-        productUrl: best.href,
-        capturedJsonCount: captured.length,
-        capturedJsonSnippets: captured.slice(0, 3).map((t) => t.slice(0, 400)),
-        domPriceRows: domPrices.slice(0, 20),
-        bodyTextSample: bodyText,
+/* reshape Apify storePrices[] -> { Tesco: {stocked, price, ...}, ... } */
+function reshape(storePrices) {
+  const out = {};
+  for (const sp of storePrices || []) {
+    const r = normaliseRetailer(sp.store);
+    if (!r) continue;
+    const price = typeof sp.price === "number" ? sp.price : parseFloat(String(sp.price).replace(/[^\d.]/g, ""));
+    if (isNaN(price) || price <= 0) continue;
+    if (!out[r] || price < out[r].price) {
+      out[r] = {
+        stocked: true,
+        price,
+        source: "trolley.co.uk",
+        offer: sp.promotionalOffer || null,
       };
     }
-
-    await page.close();
-
-    const found = Object.keys(results).length;
-    console.log(`[scrape] ${wineName}: ${found} retailers`);
-    return { matchedProduct: best.title, prices: results, debug };
-  } catch (e) {
-    console.error(`[scrape] ${wineName} error:`, e.message);
-    try { await page.close(); } catch (_) {}
-    return null;
   }
+  return out;
 }
 
-app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+/* ---------- core ---------- */
+async function resolveProductId(wineName) {
+  const items = await runActor({
+    mode: "search",
+    searchQuery: wineName,
+    sortOrder: "relevance",
+    maxItems: 12,
+  });
+  const best = pickBest(items, wineName);
+  return best ? { productId: best.productId, matchedName: best.name } : null;
+}
+
+async function fetchPricesForIds(idList) {
+  if (!idList.length) return {};
+  const items = await runActor({ mode: "byProductIds", productIds: idList });
+  const byId = {};
+  for (const it of items) {
+    if (it.productId) byId[it.productId] = reshape(it.storePrices);
+  }
+  return byId;
+}
+
+/* ---------- routes ---------- */
+app.get("/health", (req, res) =>
+  res.json({ status: "ok", uptime: process.uptime(), tokenSet: !!APIFY_TOKEN }));
 
 app.get("/test", async (req, res) => {
-  const wine = req.query.wine || "Whispering Angel";
-  const wantDebug = req.query.debug === "1";
-  const out = await scrapeWine(String(wine), wantDebug);
-  res.json({ wine, result: out });
+  try {
+    const wine = req.query.wine || "Whispering Angel";
+    const resolved = await resolveProductId(String(wine));
+    if (!resolved) return res.json({ wine, matched: null, prices: {} });
+    const priceMap = await fetchPricesForIds([resolved.productId]);
+    res.json({ wine, matched: resolved.matchedName, productId: resolved.productId, prices: priceMap[resolved.productId] || {} });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/prices", async (req, res) => {
-  const { wines } = req.body;
-  if (!Array.isArray(wines)) return res.status(400).json({ error: "wines must be an array" });
-  if (wines.length > 25) return res.status(400).json({ error: "max 25 wines" });
+  try {
+    const { wines } = req.body;
+    if (!Array.isArray(wines)) return res.status(400).json({ error: "wines must be an array" });
+    if (wines.length > 25) return res.status(400).json({ error: "max 25 wines" });
 
-  const cache = loadCache();
-  const results = {};
-  let fetched = 0, cached = 0;
+    const cache = loadCache();
+    const results = {};
+    const needPrice = []; // { name, productId }
+    let cached = 0;
 
-  for (const w of wines) {
-    const name = String(w.name || w).trim();
-    if (!name) continue;
-    const key = name.toLowerCase();
+    // Step 1: resolve productIds (from cache or via search)
+    for (const w of wines) {
+      const name = String(w.name || w).trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      const entry = cache[key] || {};
 
-    if (cache[key] && fresh(cache[key])) {
-      results[name] = cache[key].data;
-      cached++;
-      continue;
+      // fresh price cache -> use directly
+      if (entry.priceAt && ageOk(entry.priceAt, PRICE_TTL) && entry.data) {
+        results[name] = entry.data;
+        cached++;
+        continue;
+      }
+
+      // have a valid productId mapping?
+      let productId = ageOk(entry.idAt, ID_TTL) ? entry.productId : null;
+      if (!productId) {
+        const resolved = await resolveProductId(name);
+        if (resolved) {
+          productId = resolved.productId;
+          cache[key] = { ...entry, productId, matchedName: resolved.matchedName, idAt: new Date().toISOString() };
+        } else {
+          cache[key] = { ...entry, productId: null, idAt: new Date().toISOString() };
+          results[name] = null;
+          continue;
+        }
+      }
+      needPrice.push({ name, key, productId });
     }
 
-    const out = await scrapeWine(name);
-    const prices = out && out.prices && Object.keys(out.prices).length ? out.prices : null;
-    cache[key] = { data: prices, at: new Date().toISOString(), matched: out?.matchedProduct || null };
-    results[name] = prices;
-    if (prices) fetched++;
-    saveCache(cache);
-    await new Promise((r) => setTimeout(r, 800));
-  }
+    // Step 2: one batched byProductIds call for everything that needs fresh prices
+    if (needPrice.length) {
+      const idList = [...new Set(needPrice.map((n) => n.productId))];
+      const priceMap = await fetchPricesForIds(idList);
+      for (const n of needPrice) {
+        const data = priceMap[n.productId] || null;
+        results[n.name] = data;
+        cache[n.key] = { ...cache[n.key], data, priceAt: new Date().toISOString() };
+      }
+    }
 
-  res.json({ results, fetched, cached, note: `Fetched ${fetched}, ${cached} cached (7-day). Live from Trolley.co.uk.` });
+    saveCache(cache);
+    res.json({
+      results,
+      fetched: needPrice.length,
+      cached,
+      note: `Fetched ${needPrice.length}, ${cached} from 7-day cache. Live via Apify/Trolley.`,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.listen(PORT, () => console.log(`Wine backend (Puppeteer, strict) on :${PORT}`));
+app.listen(PORT, () => console.log(`Wine backend (Apify) on :${PORT} — token ${APIFY_TOKEN ? "set" : "MISSING"}`));
