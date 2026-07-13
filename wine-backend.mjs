@@ -48,21 +48,23 @@ function normaliseRetailer(name) {
 }
 
 // Words that mark a NON-standard variant we should avoid unless explicitly searched
-const VARIANT_WORDS = ["limited edition","magnum","the beach","gift","half bottle","187ml","half","1.5l","3l","jeroboam","personalised","case of","x6","x 6","6 x","12 x"];
+const VARIANT_WORDS = ["limited edition","magnum","the beach","gift","half bottle","187ml","18.7cl","37.5cl","25cl","20cl","half","1.5l","3l","jeroboam","personalised","case of","x6","x 6","6 x","12 x"];
+const SMALL_FORMATS = ["37.5cl","18.7cl","187ml","25cl","20cl","half bottle"];
 
 /* Score how well a product title matches the query.
    Higher = better. Returns -1 if it should be rejected. */
 function matchScore(title, queryTerms, query) {
   const t = title.toLowerCase();
+  const ql = query.toLowerCase();
   // every query word must be present
   for (const w of queryTerms) { if (!t.includes(w)) return -1; }
   let score = 100;
-  // penalise variant products unless the query asked for that word
-  for (const vw of VARIANT_WORDS) {
-    if (t.includes(vw) && !query.toLowerCase().includes(vw)) score -= 40;
-  }
-  // prefer shorter titles (closer to the plain product)
-  score -= Math.min(30, Math.floor(t.length / 6));
+  // strongly prefer the standard 75cl bottle
+  if (t.includes("75cl") || t.includes("750ml")) score += 30;
+  // heavily penalise small formats unless the query asked for one
+  for (const sf of SMALL_FORMATS) { if (t.includes(sf) && !ql.includes(sf)) score -= 70; }
+  // penalise other variant products unless explicitly searched
+  for (const vw of VARIANT_WORDS) { if (t.includes(vw) && !ql.includes(vw)) score -= 40; }
   return score;
 }
 
@@ -100,7 +102,7 @@ function harvestPrices(node, out, depth = 0) {
   for (const k of keys) harvestPrices(node[k], out, depth + 1);
 }
 
-async function scrapeWine(wineName) {
+async function scrapeWine(wineName, wantDebug = false) {
   const browser = await getBrowser();
   const page = await browser.newPage();
   let captured = [];
@@ -159,18 +161,63 @@ async function scrapeWine(wineName) {
     await new Promise((r) => setTimeout(r, 1800));
 
     const results = {};
+
+    // Strategy A: JSON harvest (if Trolley exposes it)
     for (const text of captured) {
       try { harvestPrices(JSON.parse(text), results); } catch (_) {}
     }
 
+    // Strategy B: DOM extraction — find each retailer row and its price via DOM containment
+    const domPrices = await page.evaluate(() => {
+      const RETAILERS = ["Tesco", "Sainsbury", "Asda", "ASDA", "Waitrose", "Ocado", "Morrisons", "Iceland", "Co-op", "Aldi", "Lidl"];
+      const out = [];
+      const priceRe = /£\s?(\d+\.\d{2})/;
+      const all = Array.from(document.querySelectorAll("a, div, li, span, td, tr, article, section"));
+      for (const el of all) {
+        const own = (el.textContent || "").trim();
+        if (own.length > 120) continue;
+        const rName = RETAILERS.find((r) => own.toLowerCase().includes(r.toLowerCase()));
+        if (!rName) continue;
+        let node = el;
+        for (let hop = 0; hop < 4 && node; hop++) {
+          const txt = node.textContent || "";
+          const m = txt.match(priceRe);
+          if (m) {
+            const clean = txt.replace(/\s+/g, " ").trim().slice(0, 100);
+            out.push({ retailer: rName, price: parseFloat(m[1]), context: clean });
+            break;
+          }
+          node = node.parentElement;
+        }
+      }
+      return out;
+    });
+
+    for (const dp of domPrices) {
+      if (/per\s?(100)?\s?ml|per\s?l|\/l|per\s?litre/i.test(dp.context)) continue;
+      const r = normaliseRetailer(dp.retailer);
+      if (r && !results[r] && dp.price >= 2 && dp.price < 500) {
+        results[r] = { stocked: true, price: dp.price, source: "trolley.co.uk" };
+      }
+    }
+
+    let debug = null;
+    if (wantDebug) {
+      const bodyText = await page.evaluate(() => (document.body.innerText || "").replace(/\n{2,}/g, "\n").slice(0, 2500));
+      debug = {
+        productUrl: best.href,
+        capturedJsonCount: captured.length,
+        capturedJsonSnippets: captured.slice(0, 3).map((t) => t.slice(0, 400)),
+        domPriceRows: domPrices.slice(0, 20),
+        bodyTextSample: bodyText,
+      };
+    }
+
     await page.close();
 
-    if (Object.keys(results).length > 0) {
-      console.log(`[scrape] ${wineName}: ${Object.keys(results).length} retailers`);
-      return { matchedProduct: best.title, prices: results };
-    }
-    console.log(`[scrape] ${wineName}: matched product but no clean prices`);
-    return { matchedProduct: best.title, prices: {} };
+    const found = Object.keys(results).length;
+    console.log(`[scrape] ${wineName}: ${found} retailers`);
+    return { matchedProduct: best.title, prices: results, debug };
   } catch (e) {
     console.error(`[scrape] ${wineName} error:`, e.message);
     try { await page.close(); } catch (_) {}
@@ -182,7 +229,8 @@ app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime
 
 app.get("/test", async (req, res) => {
   const wine = req.query.wine || "Whispering Angel";
-  const out = await scrapeWine(String(wine));
+  const wantDebug = req.query.debug === "1";
+  const out = await scrapeWine(String(wine), wantDebug);
   res.json({ wine, result: out });
 });
 
