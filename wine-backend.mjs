@@ -59,20 +59,26 @@ const VARIANT_WORDS = ["the pale","the beach","rock angel","magnum","limited edi
 const SMALL_FORMATS = ["37.5cl","18.7cl","187ml","25cl","20cl","half"];
 const LARGE_FORMATS = ["150cl","100cl","1.5l","1.5 l","3l","3 l","magnum","jeroboam","double magnum"];
 
-/* choose the product record that best matches the wine name, preferring 75cl */
+/* choose the product record that best matches the wine name, preferring standard 75cl */
 function pickBest(items, wineName) {
-  const terms = wineName.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+  const ql = wineName.toLowerCase();
+  const terms = ql.split(/\s+/).filter((w) => w.length > 1);
   let best = null, bestScore = -1;
   for (const it of items) {
     const name = String(it.name || "").toLowerCase();
+    const brand = String(it.brand || "").toLowerCase();
+    const desc = String(it.description || "").toLowerCase();
     const size = String(it.size || "").toLowerCase();
-    if (!name) continue;
-    if (!terms.every((w) => name.includes(w))) continue; // must contain all query words
+    const hay = `${brand} ${name} ${desc}`;
+
+    if (!size.includes("cl")) continue;                 // wine bottles are in cl on Trolley -> filters cosmetics
+    if (!terms.every((w) => hay.includes(w))) continue;  // all query words present across brand+name+desc
+
     let score = 100;
-    if (size.includes("75cl") || size.includes("750ml") || name.includes("75cl")) score += 30;
-    for (const sf of SMALL_FORMATS) { if ((size.includes(sf) || name.includes(sf)) && !wineName.toLowerCase().includes(sf)) score -= 70; }
-    for (const lf of LARGE_FORMATS) { if ((size.includes(lf) || name.includes(lf)) && !wineName.toLowerCase().includes(lf)) score -= 70; }
-    for (const vw of VARIANT_WORDS) { if (name.includes(vw) && !wineName.toLowerCase().includes(vw)) score -= 45; }
+    if (size.includes("75cl") || size.includes("750ml")) score += 30;
+    for (const sf of SMALL_FORMATS) { if (size.includes(sf) && !ql.includes(sf)) score -= 70; }
+    for (const lf of LARGE_FORMATS) { if ((size.includes(lf) || hay.includes(lf)) && !ql.includes(lf)) score -= 70; }
+    for (const vw of VARIANT_WORDS) { if (hay.includes(vw) && !ql.includes(vw)) score -= 45; }
     if (score > bestScore) { bestScore = score; best = it; }
   }
   return bestScore >= 0 ? best : null;
@@ -133,8 +139,8 @@ app.get("/test", async (req, res) => {
     const best = pickBest(items, String(wine));
 
     if (wantDebug) {
-      const candidates = items.map((it) => ({ productId: it.productId, name: it.name, size: it.size, price: it.price }));
-      return res.json({ wine, matched: best?.name || null, productId: best?.productId || null, candidates });
+      const candidates = items.map((it) => ({ productId: it.productId, name: it.name, brand: it.brand, description: it.description, size: it.size, price: it.price }));
+      return res.json({ wine, matched: best?.name || null, matchedBrand: best?.brand || null, productId: best?.productId || null, candidates });
     }
 
     if (!best) return res.json({ wine, matched: null, prices: {} });
