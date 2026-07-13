@@ -144,6 +144,13 @@ app.get("/test", async (req, res) => {
     }
 
     if (!best) return res.json({ wine, matched: null, prices: {} });
+
+    // raw=1 dumps the untouched byProductIds output so we can see the real field names
+    if (req.query.raw === "1") {
+      const rawItems = await runActor({ mode: "byProductIds", productIds: [best.productId] });
+      return res.json({ wine, matched: best.name, productId: best.productId, rawByProductIds: rawItems });
+    }
+
     const priceMap = await fetchPricesForIds([best.productId]);
     res.json({ wine, matched: best.name, productId: best.productId, prices: priceMap[best.productId] || {} });
   } catch (e) {
