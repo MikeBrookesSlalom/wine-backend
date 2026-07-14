@@ -292,6 +292,23 @@ function stripLeadingTag(line) {
   }
   return { tag: null, rest: line };
 }
+function extractSectionLinks(lines) {
+  // Luke's own post has a "press below to jump to where you shop" preamble
+  // with a direct anchor link per retailer, right near the top. We reuse
+  // those as-is so section headings jump straight to his real write-up.
+  const map = {};
+  for (const raw of lines.slice(0, 20)) {
+    if (!raw.includes("⟦")) continue;
+    const linkRe = /([^⟦]*)⟦([^⟧]+)⟧/g;
+    let lm;
+    while ((lm = linkRe.exec(raw)) !== null) {
+      const canon = canonicalRetailer(lm[1].trim());
+      if (canon && !map[canon]) map[canon] = lm[2];
+    }
+  }
+  return map;
+}
+
 function parseWineListLines(lines) {
   let month = null;
   const head = lines.slice(0, 15).join(" ");
@@ -299,6 +316,7 @@ function parseWineListLines(lines) {
   if (!m) m = head.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\b\D{0,10}(20\d{2})/i);
   if (m) month = `${m[1][0].toUpperCase()}${m[1].slice(1).toLowerCase()} ${m[2]}`;
 
+  const sectionLinks = extractSectionLinks(lines);
   const sections = [];
   let current = null;
 
@@ -306,7 +324,7 @@ function parseWineListLines(lines) {
     const retailer = canonicalRetailer(raw);
     if (retailer) {
       current = sections.find((s) => s.retailer === retailer);
-      if (!current) { current = { retailer, wines: [] }; sections.push(current); }
+      if (!current) { current = { retailer, sourceUrl: sectionLinks[retailer] || null, wines: [] }; sections.push(current); }
       continue;
     }
     if (!current || !raw.includes("⟦")) continue;
