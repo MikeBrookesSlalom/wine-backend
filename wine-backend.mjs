@@ -246,6 +246,155 @@ app.get("/majestic-test", async (req, res) => {
   res.json({ wine, ...out });
 });
 
+/* ---------- Monthly wine list (Luke Flunder's Substack) ----------
+   We extract FACTS ONLY: wine name, retailer, style, buy link, and his
+   NEW/STAR PICK/PRICE DROP tags. We deliberately do NOT scrape or store
+   his written tasting-note commentary — that's his original editorial
+   content, and reproducing it wholesale every month isn't something we
+   should do even for personal use. The app links back to his post so
+   people can read his actual notes there. */
+const WINE_LIST_URL = "https://lukeflunder.substack.com/p/the-list";
+const LIST_CACHE_FILE = "/tmp/wine-list-cache.json";
+const LIST_TTL = 3 * 24 * 60 * 60 * 1000; // 3 days — monthly content, refreshed often enough to catch updates
+
+const RETAILER_CANON = [
+  ["waitrose", "Waitrose"], ["majestic", "Majestic"], ["tesco", "Tesco"],
+  ["m&s", "M&S / Ocado"], ["ocado", "M&S / Ocado"], ["marks", "M&S / Ocado"],
+  ["sainsbury", "Sainsbury's"], ["morrisons", "Morrisons"], ["aldi", "Aldi"],
+  ["asda", "ASDA"], ["co-op", "Co-op"], ["coop", "Co-op"], ["lidl", "Lidl"],
+  ["costco", "Costco"], ["low & no", "Low & No"], ["low and no", "Low & No"],
+];
+function canonicalRetailer(line) {
+  const t = line.trim().toLowerCase().replace(/[^a-z0-9&,\s|]/g, "");
+  if (!t || t.length > 40) return null;
+  for (const [needle, canon] of RETAILER_CANON) if (t.includes(needle)) return canon;
+  return null;
+}
+function htmlToLines(html) {
+  let s = html;
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+  s = s.replace(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, url, inner) => {
+    const innerText = inner.replace(/<[^>]+>/g, "");
+    return `${innerText}⟦${url}⟧`;
+  });
+  s = s.replace(/<\/(h1|h2|h3|h4|h5|h6|li|p|div)>/gi, "\n");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, "");
+  s = s.replace(/&amp;/g, "&").replace(/&#39;|&rsquo;|&lsquo;/g, "'")
+       .replace(/&rdquo;|&ldquo;/g, '"').replace(/&nbsp;/g, " ");
+  return s.split("\n").map((l) => l.trim()).filter(Boolean);
+}
+const TAG_WORDS = ["STAR PICK", "PRICE DROP", "TOP PICK", "NEW"]; // longer phrases checked first
+function stripLeadingTag(line) {
+  const upper = line.toUpperCase();
+  for (const tw of TAG_WORDS) {
+    if (upper.startsWith(tw)) return { tag: tw, rest: line.slice(tw.length).replace(/^\s+/, "") };
+  }
+  return { tag: null, rest: line };
+}
+function parseWineListLines(lines) {
+  let month = null;
+  const head = lines.slice(0, 15).join(" ");
+  let m = head.match(/THE\s+L.ST\s*-\s*([A-Za-z]+)\s+(\d{4})/i);
+  if (!m) m = head.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\b\D{0,10}(20\d{2})/i);
+  if (m) month = `${m[1][0].toUpperCase()}${m[1].slice(1).toLowerCase()} ${m[2]}`;
+
+  const sections = [];
+  let current = null;
+
+  for (const raw of lines) {
+    const retailer = canonicalRetailer(raw);
+    if (retailer) {
+      current = sections.find((s) => s.retailer === retailer);
+      if (!current) { current = { retailer, wines: [] }; sections.push(current); }
+      continue;
+    }
+    if (!current || !raw.includes("⟦")) continue;
+
+    const { tag, rest } = stripLeadingTag(raw);
+    const line = rest;
+
+    const linkRe = /([^⟦]*)⟦([^⟧]+)⟧/g;
+    let lm, chosen = null;
+    const spans = [];
+    while ((lm = linkRe.exec(line)) !== null) {
+      spans.push({ full: lm[0], name: lm[1].trim(), url: lm[2] });
+      if (!chosen && lm[1].trim() && !/^https?:\/\//i.test(lm[1].trim())) chosen = { name: lm[1].trim(), url: lm[2] };
+    }
+    if (!chosen && spans.length) chosen = spans[spans.length - 1];
+    if (!chosen) continue;
+
+    let remainder = line;
+    for (const sp of spans) remainder = remainder.replace(sp.full, " ");
+
+    let style = null, offerCode = null;
+    const styleMatch = remainder.match(/(?:(CC|NP|MC|AR)\s*)?\(\s*(S|W|R|Ro)\s*\)/i);
+    if (styleMatch) {
+      offerCode = styleMatch[1] ? styleMatch[1].toUpperCase() : null;
+      style = styleMatch[2][0].toUpperCase() + styleMatch[2].slice(1).toLowerCase();
+    }
+
+    current.wines.push({ tag, name: chosen.name, url: chosen.url, style, offerCode });
+  }
+  return { month, sections };
+}
+
+function loadListCache() {
+  try { if (fs.existsSync(LIST_CACHE_FILE)) return JSON.parse(fs.readFileSync(LIST_CACHE_FILE, "utf8")); }
+  catch (e) { console.warn("list cache load:", e.message); }
+  return null;
+}
+function saveListCache(obj) {
+  try { fs.writeFileSync(LIST_CACHE_FILE, JSON.stringify(obj)); } catch (e) { console.warn("list cache save:", e.message); }
+}
+
+async function fetchWineListHtml() {
+  const res = await fetch(WINE_LIST_URL, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      "Accept": "text/html,application/xhtml+xml",
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching wine list`);
+  return res.text();
+}
+
+app.get("/wine-list", async (req, res) => {
+  try {
+    const cached = loadListCache();
+    if (cached && Date.now() - new Date(cached.at).getTime() < LIST_TTL) {
+      return res.json({ ...cached.data, cached: true });
+    }
+    const html = await fetchWineListHtml();
+    const lines = htmlToLines(html);
+    const parsed = parseWineListLines(lines);
+    saveListCache({ data: parsed, at: new Date().toISOString() });
+    res.json({ ...parsed, cached: false });
+  } catch (e) {
+    // fall back to stale cache rather than a hard failure, if we have one
+    const cached = loadListCache();
+    if (cached) return res.json({ ...cached.data, cached: true, stale: true, error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/wine-list-debug", async (req, res) => {
+  try {
+    const html = await fetchWineListHtml();
+    const lines = htmlToLines(html);
+    const parsed = parseWineListLines(lines);
+    res.json({
+      month: parsed.month,
+      lineCount: lines.length,
+      sectionsFound: parsed.sections.map((s) => ({ retailer: s.retailer, wineCount: s.wines.length })),
+      firstLines: lines.slice(0, 30),
+      sampleWines: parsed.sections.slice(0, 2).map((s) => ({ retailer: s.retailer, wines: s.wines.slice(0, 3) })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/test", async (req, res) => {
   try {
     const wine = req.query.wine || "Whispering Angel";
