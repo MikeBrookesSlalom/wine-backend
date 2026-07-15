@@ -292,6 +292,25 @@ function stripLeadingTag(line) {
   }
   return { tag: null, rest: line };
 }
+// Stop parsing entirely once we hit Substack's comments/footer —
+// otherwise comment authors, dates, and copyright text get mistaken for wine rows.
+const STOP_MARKERS = [
+  /^discussion about this post$/i,
+  /^comments$/i,
+  /^restacks$/i,
+  /^top$/i,
+  /^latest$/i,
+  /^discussions$/i,
+  /^ready for more\?$/i,
+  /^subscribe$/i,
+  /^©\s*\d{4}/i,
+  /^start your substack$/i,
+  /^no posts$/i,
+];
+function isStopMarker(line) {
+  return STOP_MARKERS.some((re) => re.test(line.trim()));
+}
+
 function extractSectionLinks(lines) {
   // Luke's own post has a "press below to jump to where you shop" preamble
   // with a direct anchor link per retailer, right near the top. We reuse
@@ -321,6 +340,8 @@ function parseWineListLines(lines) {
   let current = null;
 
   for (const raw of lines) {
+    if (isStopMarker(raw)) break; // stop before comments/footer content
+
     const retailer = canonicalRetailer(raw);
     if (retailer) {
       current = sections.find((s) => s.retailer === retailer);
