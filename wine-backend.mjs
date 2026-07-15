@@ -8,6 +8,8 @@ const ACTOR = "crawlerbros~trolley-grocery-price-scraper";
 const CACHE_FILE = "/tmp/price-cache.json";
 const PRICE_TTL = 7 * 24 * 60 * 60 * 1000;   // prices: 7 days
 const ID_TTL = 90 * 24 * 60 * 60 * 1000;      // productId mapping: 90 days
+const HISTORY_FILE = "/tmp/price-history.json";
+const HISTORY_MAX_POINTS = 30; // ~7 months of weekly checks per wine
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -18,6 +20,80 @@ app.use((req, res, next) => {
   next();
 });
 
+const ageOk = (ts, ttl) => ts && Date.now() - new Date(ts).getTime() < ttl;
+
+/* ---------- price context (is this a good price right now?) ----------
+   Two sources: (1) our own log of what you've actually seen on your
+   weekly checks — the most trustworthy, but takes a few weeks to build up;
+   (2) Apify/Trolley's own priceHistory field as an immediate fallback.
+   That fallback isn't fully reliable (spot-checked against a real product
+   and found one wildly wrong data point among several good ones), so we
+   sanity-check it against the current price and simply say nothing if it
+   looks implausible, rather than risk a confidently wrong "good price!" */
+function loadHistory() {
+  try { if (fs.existsSync(HISTORY_FILE)) return JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8")); }
+  catch (e) { console.warn("history load:", e.message); }
+  return {};
+}
+function saveHistory(h) {
+  try { fs.writeFileSync(HISTORY_FILE, JSON.stringify(h)); } catch (e) { console.warn("history save:", e.message); }
+}
+function recordOwnPrice(history, key, effectivePrice) {
+  if (effectivePrice == null) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const arr = history[key] || [];
+  if (arr.length && arr[arr.length - 1].date === today) {
+    arr[arr.length - 1].price = effectivePrice; // re-check same day -> update, don't duplicate
+  } else {
+    arr.push({ date: today, price: effectivePrice });
+  }
+  history[key] = arr.slice(-HISTORY_MAX_POINTS);
+}
+
+// mirrors the frontend's offer parsing so our logged "best price" matches
+// what the person actually sees on screen (Clubcard/Nectar-adjusted, etc.)
+function offerPrice(p) {
+  if (!p || typeof p.offer !== "string" || !p.offer) return null;
+  const o = p.offer;
+  let m = o.match(/(\d+)\s*for\s*£\s*([\d.]+)/i);
+  if (m) { const n = parseInt(m[1], 10), tot = parseFloat(m[2]); if (n > 0 && tot > 0) return +(tot / n).toFixed(2); }
+  m = o.match(/£\s*([\d.]+)/);
+  if (m) { const v = parseFloat(m[1]); if (v > 0) return v; }
+  return null;
+}
+function effectivePrice(p) {
+  const base = typeof p.price === "number" && !isNaN(p.price) ? p.price : Infinity;
+  const op = offerPrice(p);
+  return op != null && op < base ? op : base;
+}
+function bestEffective(pricesMap) {
+  let best = Infinity;
+  for (const r in pricesMap || {}) {
+    const p = pricesMap[r];
+    if (!p || !p.stocked) continue;
+    const eff = effectivePrice(p);
+    if (eff < best) best = eff;
+  }
+  return isFinite(best) ? best : null;
+}
+
+function buildContext(current, historyNumbers, basis) {
+  if (current == null || !historyNumbers || historyNumbers.length < 2) return null;
+  const avg = historyNumbers.reduce((a, b) => a + b, 0) / historyNumbers.length;
+  const low = Math.min(...historyNumbers);
+  if (avg <= 0) return null;
+  const ratio = current / avg;
+  if (ratio < 0.25 || ratio > 4) return null; // doesn't add up vs history -> say nothing rather than guess
+
+  let label = null;
+  if (current < low) label = "Lowest seen yet";
+  else if (current <= low * 1.03) label = "Near lowest seen";
+  else if (current <= avg * 0.92) label = "Below average";
+  else if (current >= avg * 1.12) label = "Higher than usual";
+  if (!label) return null;
+  return { label, basis, avg: Math.round(avg * 100) / 100, low: Math.round(low * 100) / 100, points: historyNumbers.length };
+}
+
 /* ---------- cache ---------- */
 function loadCache() {
   try { if (fs.existsSync(CACHE_FILE)) return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); }
@@ -27,7 +103,6 @@ function loadCache() {
 function saveCache(c) {
   try { fs.writeFileSync(CACHE_FILE, JSON.stringify(c)); } catch (e) { console.warn("cache save:", e.message); }
 }
-const ageOk = (ts, ttl) => ts && Date.now() - new Date(ts).getTime() < ttl;
 
 /* ---------- Apify ---------- */
 async function runActor(input) {
@@ -134,7 +209,12 @@ async function fetchPricesForIds(idList) {
   const items = await runActor({ mode: "byProductIds", productIds: idList });
   const byId = {};
   for (const it of items) {
-    if (it.productId) byId[it.productId] = reshape(it.storePrices);
+    if (it.productId) {
+      byId[it.productId] = {
+        prices: reshape(it.storePrices),
+        apifyHistory: Array.isArray(it.priceHistory) ? it.priceHistory.map((h) => h.price).filter((p) => typeof p === "number" && p > 0) : [],
+      };
+    }
   }
   return byId;
 }
@@ -456,7 +536,8 @@ app.get("/test", async (req, res) => {
     }
 
     const priceMap = await fetchPricesForIds([best.productId]);
-    res.json({ wine, matched: best.name, productId: best.productId, prices: priceMap[best.productId] || {} });
+    const entry = priceMap[best.productId] || { prices: {}, apifyHistory: [] };
+    res.json({ wine, matched: best.name, productId: best.productId, prices: entry.prices, apifyHistory: entry.apifyHistory });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -469,6 +550,7 @@ app.post("/prices", async (req, res) => {
     if (wines.length > 25) return res.status(400).json({ error: "max 25 wines" });
 
     const cache = loadCache();
+    const history = loadHistory();
     const results = {};
     const needPrice = []; // { name, productId }
     let cached = 0;
@@ -480,9 +562,12 @@ app.post("/prices", async (req, res) => {
       const key = name.toLowerCase();
       const entry = cache[key] || {};
 
-      // fresh price cache -> use directly
+      // fresh price cache -> use directly, with context from existing history
       if (entry.priceAt && ageOk(entry.priceAt, PRICE_TTL) && entry.data) {
-        results[name] = entry.data;
+        const effective = bestEffective(entry.data);
+        const priorPoints = (history[key] || []).map((pt) => pt.price);
+        const context = priorPoints.length >= 2 ? buildContext(effective, priorPoints, "own") : null;
+        results[name] = { prices: entry.data, context };
         cached++;
         continue;
       }
@@ -508,19 +593,30 @@ app.post("/prices", async (req, res) => {
       const idList = [...new Set(needPrice.map((n) => n.productId))];
       const priceMap = await fetchPricesForIds(idList);
       for (const n of needPrice) {
-        const data = priceMap[n.productId] || null;
-        results[n.name] = data;
-        // only cache real results; empty/blank stays uncached so it retries next check
-        if (data && Object.keys(data).length > 0) {
-          cache[n.key] = { ...cache[n.key], data, priceAt: new Date().toISOString() };
-        } else if (cache[n.key]) {
-          delete cache[n.key].data;
-          delete cache[n.key].priceAt;
+        const entry = priceMap[n.productId] || null;
+        const prices = entry?.prices || null;
+
+        if (prices && Object.keys(prices).length > 0) {
+          const effective = bestEffective(prices);
+          // context compares against history BEFORE today's point is added
+          const priorPoints = (history[n.key] || []).map((pt) => pt.price);
+          let context = priorPoints.length >= 2 ? buildContext(effective, priorPoints, "own") : null;
+          if (!context && entry.apifyHistory && entry.apifyHistory.length >= 2) {
+            context = buildContext(effective, entry.apifyHistory, "apify");
+          }
+          recordOwnPrice(history, n.key, effective);
+
+          results[n.name] = { prices, context };
+          cache[n.key] = { ...cache[n.key], data: prices, priceAt: new Date().toISOString() };
+        } else {
+          results[n.name] = null;
+          if (cache[n.key]) { delete cache[n.key].data; delete cache[n.key].priceAt; }
         }
       }
     }
 
     saveCache(cache);
+    saveHistory(history);
     res.json({
       results,
       fetched: needPrice.length,
